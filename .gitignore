@@ -1,0 +1,13 @@
+# Build artifacts
+build/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+
+# Compiled executables
+server
+client
+
+# OpenSSL Certificates and Keys (NEVER PUSH THESE)
+*.key
+*.crt
