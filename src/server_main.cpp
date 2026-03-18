@@ -41,8 +41,9 @@ int main() {
 
     int server_fd = socket(AF_INET, SOCK_DGRAM, 0);
     
-    // CRITICAL FIX: The main socket MUST have reuse flags, otherwise Linux 
+    // The main socket MUST have reuse flags, otherwise Linux 
     // won't route follow-up packets to the individual player sockets.
+    // I already paid the price for this
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
@@ -72,7 +73,7 @@ int main() {
         socklen_t peer_len = sizeof(peer_addr);
         char discard_buf[4096];
         
-        // FIX: Normal recvfrom instead of PEEK. Actually consume the packet 
+        // Normal recvfrom instead of PEEK. Actually consume the packet 
         // from the master socket so we don't infinitely deadlock.
         if (recvfrom(server_fd, discard_buf, sizeof(discard_buf), MSG_DONTWAIT, (struct sockaddr*)&peer_addr, &peer_len) > 0) {
             std::string ip(inet_ntoa(peer_addr.sin_addr));
@@ -99,7 +100,7 @@ int main() {
             }
         }
 
-        // Process active players
+        // Processing the active players
         for (auto it = active_players.begin(); it != active_players.end(); ) {
             std::string player_id = it->first;
             SSL* ssl = it->second.ssl;
@@ -108,7 +109,7 @@ int main() {
             if (!SSL_is_init_finished(ssl)) {
                 if (SSL_do_handshake(ssl) <= 0) {
                     int err = SSL_get_error(ssl, -1);
-                    // Ignore EAGAIN/WANT_READ. Only kill on fatal errors.
+                    // Ignore EAGAIN/WANT_READ.
                     if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_SYSCALL) {
                         std::cerr << "[ERROR] Handshake failed for " << player_id << std::endl;
                         SSL_free(ssl);
