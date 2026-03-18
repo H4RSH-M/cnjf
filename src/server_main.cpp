@@ -22,7 +22,6 @@ void handle_openssl_error() {
     exit(EXIT_FAILURE);
 }
 
-// client tracker
 struct PlayerState {
     SSL* ssl;
     uint32_t highest_seq_received;
@@ -35,15 +34,19 @@ int main() {
     SSL_load_error_strings();
     SSL_CTX *ctx = SSL_CTX_new(DTLS_server_method());
     
-    // dtls requires cookie exchange for multi-client to prevent udp spoofing
-    SSL_CTX_set_options(ctx, SSL_OP_COOKIE_EXCHANGE);
-
     if (SSL_CTX_use_certificate_file(ctx, "../server.crt", SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_use_PrivateKey_file(ctx, "../server.key", SSL_FILETYPE_PEM) <= 0) {
         handle_openssl_error();
     }
 
     int server_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    
+    // CRITICAL FIX: The main socket MUST have reuse flags, otherwise Linux 
+    // won't route follow-up packets to the individual player sockets.
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -61,18 +64,17 @@ int main() {
     const std::chrono::milliseconds target_frame_time(1000 / TICK_RATE);
     uint32_t current_tick = 0;
 
-    // main server loop
     while (true) {
         auto frame_start = std::chrono::steady_clock::now();
         current_tick++;
 
-        // 1. check for new connections knocking on the raw socket
         struct sockaddr_in peer_addr;
         socklen_t peer_len = sizeof(peer_addr);
-        char peek_buf[1];
+        char discard_buf[4096];
         
-        // peek the socket without removing the packet to see who it is
-        if (recvfrom(server_fd, peek_buf, 1, MSG_PEEK | MSG_DONTWAIT, (struct sockaddr*)&peer_addr, &peer_len) > 0) {
+        // FIX: Normal recvfrom instead of PEEK. Actually consume the packet 
+        // from the master socket so we don't infinitely deadlock.
+        if (recvfrom(server_fd, discard_buf, sizeof(discard_buf), MSG_DONTWAIT, (struct sockaddr*)&peer_addr, &peer_len) > 0) {
             std::string ip(inet_ntoa(peer_addr.sin_addr));
             std::string port = std::to_string(ntohs(peer_addr.sin_port));
             std::string player_id = ip + ":" + port;
@@ -80,9 +82,7 @@ int main() {
             if (active_players.find(player_id) == active_players.end()) {
                 std::cout << "[INFO] New connection attempt from: " << player_id << std::endl;
                 
-                // linux udp hack: create a dedicated connected socket for this specific client
                 int client_fd = socket(AF_INET, SOCK_DGRAM, 0);
-                int opt = 1;
                 setsockopt(client_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
                 setsockopt(client_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
                 bind(client_fd, (const struct sockaddr *)&server_addr, sizeof(server_addr));
@@ -96,13 +96,10 @@ int main() {
                 SSL_set_accept_state(client_ssl);
 
                 active_players[player_id] = {client_ssl, 0};
-                
-                // flush the peeking packet from the main socket so we don't loop infinitely
-                recvfrom(server_fd, peek_buf, 1, MSG_DONTWAIT, NULL, NULL);
             }
         }
 
-        // 2. processing the incoming data for all established client/players
+        // Process active players
         for (auto it = active_players.begin(); it != active_players.end(); ) {
             std::string player_id = it->first;
             SSL* ssl = it->second.ssl;
@@ -111,7 +108,8 @@ int main() {
             if (!SSL_is_init_finished(ssl)) {
                 if (SSL_do_handshake(ssl) <= 0) {
                     int err = SSL_get_error(ssl, -1);
-                    if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                    // Ignore EAGAIN/WANT_READ. Only kill on fatal errors.
+                    if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_SYSCALL) {
                         std::cerr << "[ERROR] Handshake failed for " << player_id << std::endl;
                         SSL_free(ssl);
                         it = active_players.erase(it);
@@ -134,7 +132,7 @@ int main() {
                     }
                 } else if (bytes_read < 0) {
                     int err = SSL_get_error(ssl, bytes_read);
-                    if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                    if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_SYSCALL) {
                         std::cout << "[INFO] Player disconnected: " << player_id << std::endl;
                         SSL_free(ssl);
                         it = active_players.erase(it);
@@ -145,7 +143,6 @@ int main() {
             ++it;
         }
 
-        // 60 tick sleep
         auto frame_end = std::chrono::steady_clock::now();
         auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(frame_end - frame_start);
         if (elapsed_time < target_frame_time) {
