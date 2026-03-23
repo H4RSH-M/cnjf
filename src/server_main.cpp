@@ -12,10 +12,10 @@
 #include <map>
 #include <string>
 
-#include "protocol.h" 
+#include "protocol.h"
 
 #define PORT 8080
-#define TICK_RATE 60 
+#define TICK_RATE 60
 
 void handle_openssl_error() {
     ERR_print_errors_fp(stderr);
@@ -25,10 +25,11 @@ void handle_openssl_error() {
 struct PlayerState {
     SSL* ssl;
     uint32_t highest_seq_received;
+    std::chrono::steady_clock::time_point last_active;
 };
 
 int main() {
-    std::cout << "[INFO] Booting Jackfruit Game Engine (Multi-Client)..." << std::endl;
+    std::cout << "[INFO] Booting Game Networking Engine (Multi-Client)..." << std::endl;
 
     OpenSSL_add_ssl_algorithms();
     SSL_load_error_strings();
@@ -74,7 +75,7 @@ int main() {
         char discard_buf[4096];
         
         // Normal recvfrom instead of PEEK. Actually consume the packet 
-        // from the master socket so we don't infinitely deadlock.
+        // from the master socket so there is no inf deadlock.
         if (recvfrom(server_fd, discard_buf, sizeof(discard_buf), MSG_DONTWAIT, (struct sockaddr*)&peer_addr, &peer_len) > 0) {
             std::string ip(inet_ntoa(peer_addr.sin_addr));
             std::string port = std::to_string(ntohs(peer_addr.sin_port));
@@ -96,15 +97,18 @@ int main() {
                 SSL_set_bio(client_ssl, bio, bio);
                 SSL_set_accept_state(client_ssl);
 
-                active_players[player_id] = {client_ssl, 0};
+                active_players[player_id] = {client_ssl, 0, std::chrono::steady_clock::now()};
             }
         }
+
+        auto now = std::chrono::steady_clock::now();
 
         // Processing the active players
         for (auto it = active_players.begin(); it != active_players.end(); ) {
             std::string player_id = it->first;
             SSL* ssl = it->second.ssl;
             uint32_t& highest_seq = it->second.highest_seq_received;
+            bool player_dropped = false;
 
             if (!SSL_is_init_finished(ssl)) {
                 if (SSL_do_handshake(ssl) <= 0) {
@@ -112,36 +116,58 @@ int main() {
                     // Ignore EAGAIN/WANT_READ.
                     if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_SYSCALL) {
                         std::cerr << "[ERROR] Handshake failed for " << player_id << std::endl;
-                        SSL_free(ssl);
-                        it = active_players.erase(it);
-                        continue;
+                        player_dropped = true;
                     }
                 } else {
                     std::cout << "[SUCCESS] Handshake complete for " << player_id << std::endl;
+                    it->second.last_active = now;
                 }
             } else {
                 GamePacket incoming_packet;
-                int bytes_read = SSL_read(ssl, &incoming_packet, sizeof(GamePacket));
+                int bytes_read;
                 
-                if (bytes_read == sizeof(GamePacket) && incoming_packet.type == CLIENT_INPUT) {
-                    if (incoming_packet.sequence_number >= highest_seq) {
-                        highest_seq = incoming_packet.sequence_number;
-                        std::cout << "[Tick " << current_tick << " | " << player_id << "] "
-                                  << "Seq: " << incoming_packet.sequence_number 
-                                  << " | Pos: (" << incoming_packet.x << ", " << incoming_packet.y << ")" 
-                                  << std::endl;
+                while ((bytes_read = SSL_read(ssl, &incoming_packet, sizeof(GamePacket))) > 0) {
+                    it->second.last_active = now;
+                    
+                    if (bytes_read == sizeof(GamePacket) && incoming_packet.type == CLIENT_INPUT) {
+                        if (incoming_packet.sequence_number >= highest_seq) {
+                            highest_seq = incoming_packet.sequence_number;
+                            std::cout << "[Tick " << current_tick << " | " << player_id << "] "
+                                      << "Seq: " << incoming_packet.sequence_number 
+                                      << " | Pos: (" << incoming_packet.x << ", " << incoming_packet.y << ")" 
+                                      << std::endl;
+
+                            // bounce confirmed state back to the client
+                            GamePacket ack;
+                            ack.type = SERVER_STATE;
+                            ack.sequence_number = incoming_packet.sequence_number;
+                            ack.x = incoming_packet.x; 
+                            ack.y = incoming_packet.y;
+                            SSL_write(ssl, &ack, sizeof(GamePacket));
+                        }
                     }
-                } else if (bytes_read < 0) {
+                }
+                
+                if (bytes_read <= 0) {
                     int err = SSL_get_error(ssl, bytes_read);
-                    if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_SYSCALL) {
-                        std::cout << "[INFO] Player disconnected: " << player_id << std::endl;
-                        SSL_free(ssl);
-                        it = active_players.erase(it);
-                        continue;
+                    if (err == SSL_ERROR_ZERO_RETURN || (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_SYSCALL)) {
+                        std::cout << "[INFO] Player explicitly disconnected: " << player_id << std::endl;
+                        player_dropped = true;
                     }
                 }
             }
-            ++it;
+
+            if (!player_dropped && std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_active).count() > 3) {
+                std::cout << "[WARNING] Player timed out (Force Quit): " << player_id << std::endl;
+                player_dropped = true;
+            }
+
+            if (player_dropped) {
+                SSL_free(ssl);
+                it = active_players.erase(it);
+            } else {
+                ++it;
+            }
         }
 
         auto frame_end = std::chrono::steady_clock::now();
