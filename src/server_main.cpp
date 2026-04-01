@@ -11,6 +11,7 @@
 #include <thread>
 #include <map>
 #include <string>
+#include <functional>
 
 #include "protocol.h"
 
@@ -26,6 +27,8 @@ struct PlayerState {
     SSL* ssl;
     uint32_t highest_seq_received;
     std::chrono::steady_clock::time_point last_active;
+    float x;
+    float y;
 };
 
 int main() {
@@ -42,7 +45,7 @@ int main() {
 
     int server_fd = socket(AF_INET, SOCK_DGRAM, 0);
     
-    // The main socket MUST have reuse flags, otherwise Linux 
+    // note to self: The main socket must have reuse flags, otherwise Linux 
     // won't route follow-up packets to the individual player sockets.
     // I already paid the price for this
     int opt = 1;
@@ -97,7 +100,8 @@ int main() {
                 SSL_set_bio(client_ssl, bio, bio);
                 SSL_set_accept_state(client_ssl);
 
-                active_players[player_id] = {client_ssl, 0, std::chrono::steady_clock::now()};
+                // Starts the players roughly in the center of the screen
+                active_players[player_id] = {client_ssl, 0, std::chrono::steady_clock::now(), 400.0f, 300.0f};
             }
         }
 
@@ -132,17 +136,35 @@ int main() {
                     if (bytes_read == sizeof(GamePacket) && incoming_packet.type == CLIENT_INPUT) {
                         if (incoming_packet.sequence_number >= highest_seq) {
                             highest_seq = incoming_packet.sequence_number;
+                            
+                            // Updating the authoritative server position
+                            it->second.x = incoming_packet.x;
+                            it->second.y = incoming_packet.y;
+
                             std::cout << "[Tick " << current_tick << " | " << player_id << "] "
                                       << "Seq: " << incoming_packet.sequence_number 
                                       << " | Pos: (" << incoming_packet.x << ", " << incoming_packet.y << ")" 
                                       << std::endl;
 
-                            // bounce confirmed state back to the client
+                            // bounce the confirmed state back to the client
                             GamePacket ack;
                             ack.type = SERVER_STATE;
                             ack.sequence_number = incoming_packet.sequence_number;
                             ack.x = incoming_packet.x; 
                             ack.y = incoming_packet.y;
+                            
+                            // Pack all OTHER players into the broadcast payload
+                            ack.num_other_players = 0;
+                            for (const auto& other : active_players) {
+                                if (other.first != player_id && ack.num_other_players < 8) {
+                                    // Hash the IP string to create a unique color/ID for rendering
+                                    ack.other_players[ack.num_other_players].id = (uint32_t)std::hash<std::string>{}(other.first);
+                                    ack.other_players[ack.num_other_players].x = other.second.x;
+                                    ack.other_players[ack.num_other_players].y = other.second.y;
+                                    ack.num_other_players++;
+                                }
+                            }
+                            
                             SSL_write(ssl, &ack, sizeof(GamePacket));
                         }
                     }

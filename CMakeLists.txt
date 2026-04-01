@@ -1,18 +1,35 @@
-cmake_minimum_required(VERSION 3.10)
-project(JackfruitEngine VERSION 1.0)
+cmake_minimum_required(VERSION 3.14)
+project(GameNetworkingEngine)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+include_directories(src include .)
 find_package(OpenSSL REQUIRED)
 
-# Tell the compiler where to find headers
-include_directories(${OPENSSL_INCLUDE_DIR} include)
+# RAYLIB AUTO-DOWNLOADER
 
-# server exec
-add_executable(server src/server_main.cpp)
-target_link_libraries(server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+include(FetchContent)
+FetchContent_Declare(
+    raylib
+    URL https://github.com/raysan5/raylib/archive/refs/tags/5.0.tar.gz
+)
+FetchContent_MakeAvailable(raylib)
 
-# client executable
+# SERVER EXECUTABLE (Linux)
+
+if(UNIX)
+    message(STATUS "Linux detected: Building the Game Server...")
+    add_executable(server src/server_main.cpp)
+    target_link_libraries(server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
+# CLIENT EXECUTABLE (Universal with GUI)
+
 add_executable(client src/client_main.cpp)
-target_link_libraries(client PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(client PRIVATE OpenSSL::SSL OpenSSL::Crypto raylib)
+
+if(WIN32)
+    message(STATUS "Windows detected: Linking Winsock and Windows Media libraries...")
+    target_link_libraries(client PRIVATE ws2_32 winmm)
+endif()

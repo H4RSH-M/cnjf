@@ -1,21 +1,35 @@
 #include <iostream>
 #include <cstring>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <protocol.h>
 #include <queue>
 #include <random>
 #include <chrono>
 #include <vector>
 #include <algorithm>
-#include <signal.h>
+#include <csignal>
+#include <thread>
 
-#define SERVER_IP "127.0.0.1"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include "protocol.h"
+#include "raylib.h"
+
+// windows networking garbage vs linux posix
+#if defined(_WIN32)
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+    #define SOCKET int
+    #define INVALID_SOCKET -1
+    #define closesocket close
+#endif
+
+#define SERVER_IP "127.0.0.1" // change if testing over actual network
 #define PORT 8080
 
 volatile sig_atomic_t engine_running = 1;
@@ -82,14 +96,28 @@ public:
 
 int main() {
     signal(SIGINT, handle_sigint);
+    
+    // windows needs this wsa init nonsense
+#if defined(_WIN32)
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed." << std::endl;
+        return 1;
+    }
+#endif
+
     std::cout << "[INFO] Game Networking Engine Client booting up..." << std::endl;
 
+    // dtls setup
     OpenSSL_add_ssl_algorithms();
     SSL_load_error_strings();
     SSL_CTX *ctx = SSL_CTX_new(DTLS_client_method());
 
-    // udp raw 
-    int client_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    SOCKET client_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (client_fd == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed." << std::endl;
+        return 1;
+    }
     
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
@@ -97,10 +125,8 @@ int main() {
     server_addr.sin_port = htons(PORT);
     inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
 
-    
     connect(client_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
 
-    // openssl utilisation
     SSL *ssl = SSL_new(ctx);
     BIO *bio = BIO_new_dgram(client_fd, BIO_NOCLOSE);
     
@@ -109,64 +135,116 @@ int main() {
 
     std::cout << "[INFO] Initiating DTLS Handshake with server at " << SERVER_IP << ":" << PORT << "..." << std::endl;
     
-    // handshake attempt
     if (SSL_connect(ssl) <= 0) {
         std::cerr << "[ERROR] DTLS Handshake failed or timed out!" << std::endl;
         ERR_print_errors_fp(stderr);
     } else {
-        std::cout << "[SUCCESS] DTLS Connection Established! Entering Game Loop..." << std::endl;
+        std::cout << "[SUCCESS] DTLS Connection Established! Booting GUI..." << std::endl;
         
+        // set non blocking based on os
+#if defined(_WIN32)
+        u_long mode = 1;
+        ioctlsocket(client_fd, FIONBIO, &mode);
+#else
         int flags = fcntl(client_fd, F_GETFL, 0);
         fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+        // fire up raylib
+        InitWindow(800, 600, "Game Networking Engine");
+        SetTargetFPS(60);
 
         uint32_t current_sequence = 0;
-        float player_x = 0.0f;
         
-        // lag simulator 
-        // 150ms base ping, 50ms random jitter, 15% packet drop chance
+        // spawn mid screen
+        float player_x = 400.0f;
+        float player_y = 300.0f;
+        const float MOVEMENT_SPEED = 4.0f;
+        
+        // 150ms base ping, 50ms random jitter, 15% drop
         LagSim bad_wifi(150, 50, 0.15f);
 
         std::vector<GamePacket> history_buffer;
+        std::vector<OtherPlayer> remote_players;
 
-        while(engine_running) {
+        // main loop
+        while(!WindowShouldClose() && engine_running) {
+            
+            // get wasd inputs
+            if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) { player_y -= MOVEMENT_SPEED; }
+            if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) { player_y += MOVEMENT_SPEED; }
+            if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) { player_x -= MOVEMENT_SPEED; }
+            if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) { player_x += MOVEMENT_SPEED; }
+
+            // heartbeat packet so server doesnt kick us
             GamePacket packet;
             packet.type = CLIENT_INPUT;
             packet.sequence_number = current_sequence++;
             packet.x = player_x;
-            packet.y = 0.0f;
+            packet.y = player_y;
             
             history_buffer.push_back(packet);
 
-            // feed packet to lsgsim insteas of socket
+            // dump into lag sim instead of sending straight out
             bad_wifi.Add(packet);
             
-            player_x += 1.5f; 
-            
+            // read auth state from server
             GamePacket server_reply;
             while (SSL_read(ssl, &server_reply, sizeof(GamePacket)) == sizeof(GamePacket)) {
                 if (server_reply.type == SERVER_STATE) {
-                    std::cout << "[RECONCILE] Server confirmed Seq " << server_reply.sequence_number << ". Clearing old history." << std::endl;
                     
+                    // dump confirmed history
                     history_buffer.erase(
                         std::remove_if(history_buffer.begin(), history_buffer.end(),
                             [&](const GamePacket& p) { return p.sequence_number <= server_reply.sequence_number; }),
                         history_buffer.end()
                     );
+
+                    // update the remote guys for rendering
+                    remote_players.clear();
+                    for(int i = 0; i < server_reply.num_other_players; i++) {
+                        remote_players.push_back(server_reply.other_players[i]);
+                    }
                 }
             }
 
-            // push any packets that are done waiting
+            // push packets that finished waiting
             bad_wifi.Update(ssl);
 
-            usleep(16666);
+            BeginDrawing();
+            ClearBackground(RAYWHITE);
+            
+            // draw other players (red)
+            for (const auto& other : remote_players) {
+                DrawCircle((int)other.x, (int)other.y, 20, RED);
+                DrawText(TextFormat("ID: %u", other.id % 1000), (int)other.x - 20, (int)other.y - 35, 10, DARKGRAY);
+            }
+
+            // draw us on top (blue)
+            DrawCircle((int)player_x, (int)player_y, 20, BLUE);
+            DrawText("YOU", (int)player_x - 12, (int)player_y - 35, 10, DARKBLUE);
+
+            // text overlay stuff
+            DrawText("WASD/Arrows to Move", 10, 10, 20, DARKGRAY);
+            DrawText(TextFormat("Ping Sim: %d ms", 150), 10, 30, 20, GRAY);
+            DrawText(TextFormat("Connected Players: %d", remote_players.size() + 1), 10, 50, 20, GRAY);
+
+            EndDrawing();
         }
+        
+        CloseWindow();
     }
 
     std::cout << "\n[INFO] Graceful shutdown initiated. Sending disconnect signal..." << std::endl;
     SSL_shutdown(ssl);
 
     SSL_free(ssl);
-    close(client_fd);
+    closesocket(client_fd);
+    
+#if defined(_WIN32)
+    WSACleanup();
+#endif
+    
     SSL_CTX_free(ctx);
     return 0;
 }
