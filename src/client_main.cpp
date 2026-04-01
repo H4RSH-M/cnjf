@@ -1,3 +1,15 @@
+// windows header collision hack
+#if defined(_WIN32)
+    // rename windows functions before they load
+    #define Rectangle WinRectangle
+    #define CloseWindow WinCloseWindow
+    #define ShowCursor WinShowCursor
+    #define DrawText WinDrawText
+    #define DrawTextEx WinDrawTextEx
+    #define LoadImage WinLoadImage
+    #define PlaySound WinPlaySound
+#endif
+
 #include <iostream>
 #include <cstring>
 #include <queue>
@@ -11,13 +23,20 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "protocol.h"
-#include "raylib.h"
 
-// windows networking garbage vs linux posix
 #if defined(_WIN32)
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
+
+    // undo the renames so raylib works
+    #undef Rectangle
+    #undef CloseWindow
+    #undef ShowCursor
+    #undef DrawText
+    #undef DrawTextEx
+    #undef LoadImage
+    #undef PlaySound
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
@@ -28,6 +47,8 @@
     #define INVALID_SOCKET -1
     #define closesocket close
 #endif
+
+#include "raylib.h"
 
 #define SERVER_IP "127.0.0.1" // change if testing over actual network
 #define PORT 8080
@@ -51,7 +72,7 @@ private:
     int jitter;
     float loss_rate; 
 
-    // rng tools
+    // rng stuff
     std::mt19937 rng;
     std::uniform_real_distribution<float> drop_dice;
     std::uniform_int_distribution<int> jitter_dice;
