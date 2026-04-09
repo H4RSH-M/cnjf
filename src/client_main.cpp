@@ -1,6 +1,5 @@
 // windows header collision hack
 #if defined(_WIN32)
-    // rename windows functions before they load
     #define Rectangle WinRectangle
     #define CloseWindow WinCloseWindow
     #define ShowCursor WinShowCursor
@@ -19,11 +18,14 @@
 #include <algorithm>
 #include <csignal>
 #include <thread>
+#include <iomanip>
+#include <sstream>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "protocol.h"
 
+// windows needs this wsa init nonsense
 #if defined(_WIN32)
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -50,7 +52,7 @@
 
 #include "raylib.h"
 
-#define SERVER_IP "127.0.0.1" // change if testing over actual network
+#define SERVER_IP "127.0.0.1" 
 #define PORT 8080
 
 volatile sig_atomic_t engine_running = 1;
@@ -85,10 +87,7 @@ public:
     // hijack the packet instead of sending it
     void Add(const GamePacket& pkt) {
         // roll the dice to see if we delete it
-        if (drop_dice(rng) < loss_rate) {
-            std::cout << "[SIM] Yeeted packet " << pkt.sequence_number << " into the void.\n";
-            return; 
-        }
+        if (drop_dice(rng) < loss_rate) return; 
 
         // how long to hold it hostage
         int delay = ping + jitter_dice(rng);
@@ -100,7 +99,6 @@ public:
 
     void Update(SSL* ssl) {
         auto now = std::chrono::steady_clock::now();
-
         while (!q.empty()) {
             if (now >= q.front().release_time) {
                 // buffering done, ab sending the packet
@@ -118,7 +116,6 @@ public:
 int main() {
     signal(SIGINT, handle_sigint);
     
-    // windows needs this wsa init nonsense
 #if defined(_WIN32)
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -135,10 +132,7 @@ int main() {
     SSL_CTX *ctx = SSL_CTX_new(DTLS_client_method());
 
     SOCKET client_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (client_fd == INVALID_SOCKET) {
-        std::cerr << "Socket creation failed." << std::endl;
-        return 1;
-    }
+    if (client_fd == INVALID_SOCKET) return 1;
     
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
@@ -155,49 +149,67 @@ int main() {
     SSL_set_bio(ssl, bio, bio);
 
     std::cout << "[INFO] Initiating DTLS Handshake with server at " << SERVER_IP << ":" << PORT << "..." << std::endl;
-    
+
     if (SSL_connect(ssl) <= 0) {
-        std::cerr << "[ERROR] DTLS Handshake failed or timed out!" << std::endl;
         ERR_print_errors_fp(stderr);
-    } else {
-        std::cout << "[SUCCESS] DTLS Connection Established! Booting GUI..." << std::endl;
+        return 1;
+    }
+    
+    std::cout << "[SUCCESS] DTLS Connection Established! Booting GUI..." << std::endl;
         
-        // set non blocking based on os
+    // set non blocking based on os
 #if defined(_WIN32)
-        u_long mode = 1;
-        ioctlsocket(client_fd, FIONBIO, &mode);
+    u_long mode = 1;
+    ioctlsocket(client_fd, FIONBIO, &mode);
 #else
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+    int flags = fcntl(client_fd, F_GETFL, 0);
+    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
 #endif
 
-        // fire up raylib
-        InitWindow(800, 600, "Game Networking Engine");
-        SetTargetFPS(60);
+    // fire up raylib
+    InitWindow(800, 600, "Game Networking Engine");
+    SetTargetFPS(60);
 
-        uint32_t current_sequence = 0;
-        
-        // spawn mid screen
-        float player_x = 400.0f;
-        float player_y = 300.0f;
-        const float MOVEMENT_SPEED = 4.0f;
-        
-        // 150ms base ping, 50ms random jitter, 15% drop
-        LagSim bad_wifi(150, 50, 0.15f);
+    // Custom Theme Colors
+    Color bgDark = { 11, 19, 43, 255 };
+    Color gridColor = { 28, 37, 65, 255 };
+    Color playerCore = { 0, 200, 255, 255 };
+    Color playerGlow = { 0, 100, 255, 150 };
+    Color enemyCore = { 255, 50, 80, 255 };
+    Color enemyGlow = { 200, 0, 50, 150 };
+    Color textNeon = { 0, 255, 200, 255 };
+    Color bottomBarBg = { 0, 0, 0, 200 };
 
-        std::vector<GamePacket> history_buffer;
-        std::vector<OtherPlayer> remote_players;
+    uint32_t current_sequence = 0;
+    int latest_ack = 0;
+    
+    // spawn mid screen
+    float player_x = 400.0f;
+    float player_y = 300.0f;
+    const float MOVEMENT_SPEED = 4.0f;
+    
+    LagSim bad_wifi(150, 50, 0.15f);
 
-        // main loop
-        while(!WindowShouldClose() && engine_running) {
-            
-            // get wasd inputs
-            if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) { player_y -= MOVEMENT_SPEED; }
-            if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) { player_y += MOVEMENT_SPEED; }
-            if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) { player_x -= MOVEMENT_SPEED; }
-            if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) { player_x += MOVEMENT_SPEED; }
+    std::vector<GamePacket> history_buffer;
+    std::vector<OtherPlayer> remote_players;
+    
+    auto last_send_time = std::chrono::steady_clock::now();
 
-            // heartbeat packet so server doesnt kick us
+    // main loop
+    while(!WindowShouldClose() && engine_running) {
+        bool moved = false;
+
+        // get wasd inputs
+        if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) { player_y -= MOVEMENT_SPEED; moved = true; }
+        if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) { player_y += MOVEMENT_SPEED; moved = true; }
+        if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) { player_x -= MOVEMENT_SPEED; moved = true; }
+        if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) { player_x += MOVEMENT_SPEED; moved = true; }
+
+        auto now = std::chrono::steady_clock::now();
+        bool is_heartbeat = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_send_time).count() > 1000;
+
+        // heartbeat packet so server doesnt kick us
+        if (moved || is_heartbeat) {
             GamePacket packet;
             packet.type = CLIENT_INPUT;
             packet.sequence_number = current_sequence++;
@@ -205,67 +217,82 @@ int main() {
             packet.y = player_y;
             
             history_buffer.push_back(packet);
-
+            
             // dump into lag sim instead of sending straight out
             bad_wifi.Add(packet);
-            
-            // read auth state from server
-            GamePacket server_reply;
-            while (SSL_read(ssl, &server_reply, sizeof(GamePacket)) == sizeof(GamePacket)) {
-                if (server_reply.type == SERVER_STATE) {
-                    
-                    // dump confirmed history
-                    history_buffer.erase(
-                        std::remove_if(history_buffer.begin(), history_buffer.end(),
-                            [&](const GamePacket& p) { return p.sequence_number <= server_reply.sequence_number; }),
-                        history_buffer.end()
-                    );
-
-                    // update the remote guys for rendering
-                    remote_players.clear();
-                    for(int i = 0; i < server_reply.num_other_players; i++) {
-                        remote_players.push_back(server_reply.other_players[i]);
-                    }
-                }
-            }
-
-            // push packets that finished waiting
-            bad_wifi.Update(ssl);
-
-            BeginDrawing();
-            ClearBackground(RAYWHITE);
-            
-            // draw other players (red)
-            for (const auto& other : remote_players) {
-                DrawCircle((int)other.x, (int)other.y, 20, RED);
-                DrawText(TextFormat("ID: %u", other.id % 1000), (int)other.x - 20, (int)other.y - 35, 10, DARKGRAY);
-            }
-
-            // draw us on top (blue)
-            DrawCircle((int)player_x, (int)player_y, 20, BLUE);
-            DrawText("YOU", (int)player_x - 12, (int)player_y - 35, 10, DARKBLUE);
-
-            // text overlay stuff
-            DrawText("WASD/Arrows to Move", 10, 10, 20, DARKGRAY);
-            DrawText(TextFormat("Ping Sim: %d ms", 150), 10, 30, 20, GRAY);
-            DrawText(TextFormat("Connected Players: %d", remote_players.size() + 1), 10, 50, 20, GRAY);
-
-            EndDrawing();
+            last_send_time = now;
         }
         
-        CloseWindow();
-    }
+        // read auth state from server
+        GamePacket server_reply;
+        while (SSL_read(ssl, &server_reply, sizeof(GamePacket)) == sizeof(GamePacket)) {
+            if (server_reply.type == SERVER_STATE) {
+                latest_ack = server_reply.sequence_number;
 
+                history_buffer.erase(
+                    std::remove_if(history_buffer.begin(), history_buffer.end(),
+                        [&](const GamePacket& p) { return p.sequence_number <= server_reply.sequence_number; }),
+                    history_buffer.end()
+                );
+
+                remote_players.clear();
+                for(int i = 0; i < server_reply.num_other_players; i++) {
+                    remote_players.push_back(server_reply.other_players[i]);
+                }
+            }
+        }
+
+        // push packets that finished waiting
+        bad_wifi.Update(ssl);
+
+        BeginDrawing();
+        ClearBackground(bgDark);
+        
+        // Draw Cyber Grid
+        for(int i = 0; i < 800; i += 40) DrawLine(i, 0, i, 600, gridColor);
+        for(int i = 0; i < 600; i += 40) DrawLine(0, i, 800, i, gridColor);
+        
+        // Draw Remote Players (Sharp Red)
+        for (const auto& other : remote_players) {
+            DrawRectangle((int)other.x - 15, (int)other.y - 15, 30, 30, enemyGlow);
+            DrawRectangleLines((int)other.x - 15, (int)other.y - 15, 30, 30, enemyCore);
+            DrawText(TextFormat("ID:%u", other.id % 1000), (int)other.x - 15, (int)other.y - 30, 10, WHITE);
+        }
+
+        // Draw Local Player (Sharp Neon Blue)
+        DrawRectangle((int)player_x - 15, (int)player_y - 15, 30, 30, playerGlow);
+        DrawRectangleLines((int)player_x - 15, (int)player_y - 15, 30, 30, playerCore);
+        DrawText("YOU", (int)player_x - 10, (int)player_y - 30, 10, textNeon);
+
+        // Top UI Overlay
+        DrawRectangle(5, 5, 250, 45, ColorAlpha(BLACK, 0.7f));
+        DrawRectangleLines(5, 5, 250, 45, textNeon);
+        DrawText("WASD/Arrows to Move", 15, 12, 10, GRAY);
+        DrawText(TextFormat("Active Connections: %d", remote_players.size() + 1), 15, 27, 10, WHITE);
+
+        // Bottom Bar UI (Jitter, Ping, Loss, Sequences)
+        DrawRectangle(0, 560, 800, 40, bottomBarBg);
+        DrawLine(0, 560, 800, 560, textNeon);
+        DrawText(TextFormat("PING: %dms", 150), 20, 575, 10, WHITE);
+        DrawText(TextFormat("JITTER: +/- %dms", 50), 120, 575, 10, WHITE);
+        DrawText(TextFormat("LOSS: %.0f%%", 0.15f * 100), 250, 575, 10, RED);
+        
+        DrawText(TextFormat("SEQ SENT: %d", current_sequence), 450, 575, 10, GRAY);
+        DrawText(TextFormat("LATEST ACK: %d", latest_ack), 570, 575, 10, textNeon);
+        DrawText(TextFormat("UNACKED BUFFER: %d", history_buffer.size()), 690, 575, 10, history_buffer.size() > 5 ? RED : GREEN);
+
+        EndDrawing();
+    }
+    
+    CloseWindow();
     std::cout << "\n[INFO] Graceful shutdown initiated. Sending disconnect signal..." << std::endl;
     SSL_shutdown(ssl);
-
     SSL_free(ssl);
     closesocket(client_fd);
     
 #if defined(_WIN32)
     WSACleanup();
 #endif
-    
     SSL_CTX_free(ctx);
     return 0;
 }

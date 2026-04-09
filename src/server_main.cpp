@@ -1,5 +1,6 @@
-#include <iostream>
 #include <cstring>
+#include <iostream>
+#include <fstream>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -12,6 +13,7 @@
 #include <map>
 #include <string>
 #include <functional>
+#include <iomanip>
 
 #include "protocol.h"
 
@@ -27,12 +29,32 @@ struct PlayerState {
     SSL* ssl;
     uint32_t highest_seq_received;
     std::chrono::steady_clock::time_point last_active;
+    std::chrono::steady_clock::time_point last_packet_time;
+    
+    // Stats for Dashboard
     float x;
     float y;
+    uint32_t total_packets_received;
+    uint32_t total_packets_lost;
+    int latest_arrival_gap_ms;
 };
 
+// Timestamp helper for the log file
+static std::string ts() {
+    auto now = std::chrono::system_clock::now();
+    auto t   = std::chrono::system_clock::to_time_t(now);
+    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now.time_since_epoch()).count() % 1000;
+    std::ostringstream ss;
+    ss << std::put_time(std::localtime(&t), "%H:%M:%S")
+       << "." << std::setw(3) << std::setfill('0') << ms;
+    return ss.str();
+}
+
 int main() {
-    std::cout << "[INFO] Booting Game Networking Engine (Multi-Client)..." << std::endl;
+    // Open the log file in append mode. All events go here so they don't break the dashboard.
+    std::ofstream logger("server_events.log", std::ios::out | std::ios::app);
+    logger << "\n[" << ts() << "] === SERVER BOOT SEQUENCED ===" << std::endl;
 
     OpenSSL_add_ssl_algorithms();
     SSL_load_error_strings();
@@ -63,11 +85,12 @@ int main() {
     int flags = fcntl(server_fd, F_GETFL, 0);
     fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
 
-    std::cout << "[INFO] Server running on port " << PORT << ". Ticking at " << TICK_RATE << "Hz." << std::endl;
-
     std::map<std::string, PlayerState> active_players;
     const std::chrono::milliseconds target_frame_time(1000 / TICK_RATE);
     uint32_t current_tick = 0;
+    
+    auto last_dashboard_draw = std::chrono::steady_clock::now();
+    logger << "[" << ts() << "] Server fully initialized on port " << PORT << " at " << TICK_RATE << "Hz." << std::endl;
 
     while (true) {
         auto frame_start = std::chrono::steady_clock::now();
@@ -85,14 +108,13 @@ int main() {
             std::string player_id = ip + ":" + port;
 
             if (active_players.find(player_id) == active_players.end()) {
-                std::cout << "[INFO] New connection attempt from: " << player_id << std::endl;
+                logger << "[" << ts() << "] [CONNECT] Connection attempt from: " << player_id << std::endl;
                 
                 int client_fd = socket(AF_INET, SOCK_DGRAM, 0);
                 setsockopt(client_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
                 setsockopt(client_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
                 bind(client_fd, (const struct sockaddr *)&server_addr, sizeof(server_addr));
                 connect(client_fd, (struct sockaddr*)&peer_addr, peer_len);
-                
                 fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL, 0) | O_NONBLOCK);
 
                 SSL *client_ssl = SSL_new(ctx);
@@ -101,7 +123,10 @@ int main() {
                 SSL_set_accept_state(client_ssl);
 
                 // Starts the players roughly in the center of the screen
-                active_players[player_id] = {client_ssl, 0, std::chrono::steady_clock::now(), 400.0f, 300.0f};
+                active_players[player_id] = {
+                    client_ssl, 0, std::chrono::steady_clock::now(), std::chrono::steady_clock::now(),
+                    400.0f, 300.0f, 0, 0, 0
+                };
             }
         }
 
@@ -111,7 +136,6 @@ int main() {
         for (auto it = active_players.begin(); it != active_players.end(); ) {
             std::string player_id = it->first;
             SSL* ssl = it->second.ssl;
-            uint32_t& highest_seq = it->second.highest_seq_received;
             bool player_dropped = false;
 
             if (!SSL_is_init_finished(ssl)) {
@@ -119,11 +143,11 @@ int main() {
                     int err = SSL_get_error(ssl, -1);
                     // Ignore EAGAIN/WANT_READ.
                     if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_SYSCALL) {
-                        std::cerr << "[ERROR] Handshake failed for " << player_id << std::endl;
+                        logger << "[" << ts() << "] [ERROR] Handshake failed for " << player_id << std::endl;
                         player_dropped = true;
                     }
                 } else {
-                    std::cout << "[SUCCESS] Handshake complete for " << player_id << std::endl;
+                    logger << "[" << ts() << "] [SUCCESS] Handshake complete for " << player_id << ". Encrypted tunnel established." << std::endl;
                     it->second.last_active = now;
                 }
             } else {
@@ -134,17 +158,23 @@ int main() {
                     it->second.last_active = now;
                     
                     if (bytes_read == sizeof(GamePacket) && incoming_packet.type == CLIENT_INPUT) {
-                        if (incoming_packet.sequence_number >= highest_seq) {
-                            highest_seq = incoming_packet.sequence_number;
+                        
+                        // Network Math: Sequence gaps indicate dropped packets
+                        if (it->second.highest_seq_received > 0 && incoming_packet.sequence_number > it->second.highest_seq_received + 1) {
+                            it->second.total_packets_lost += (incoming_packet.sequence_number - it->second.highest_seq_received - 1);
+                        }
+                        
+                        // Measure arrival gap (Jitter proxy)
+                        it->second.latest_arrival_gap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.last_packet_time).count();
+                        it->second.last_packet_time = now;
+                        it->second.total_packets_received++;
+
+                        if (incoming_packet.sequence_number >= it->second.highest_seq_received) {
+                            it->second.highest_seq_received = incoming_packet.sequence_number;
                             
                             // Updating the authoritative server position
                             it->second.x = incoming_packet.x;
                             it->second.y = incoming_packet.y;
-
-                            std::cout << "[Tick " << current_tick << " | " << player_id << "] "
-                                      << "Seq: " << incoming_packet.sequence_number 
-                                      << " | Pos: (" << incoming_packet.x << ", " << incoming_packet.y << ")" 
-                                      << std::endl;
 
                             // bounce the confirmed state back to the client
                             GamePacket ack;
@@ -164,23 +194,23 @@ int main() {
                                     ack.num_other_players++;
                                 }
                             }
-                            
                             SSL_write(ssl, &ack, sizeof(GamePacket));
                         }
                     }
                 }
                 
+                // Non-blocking SSL_read returns WANT_READ when no data - that's fine
                 if (bytes_read <= 0) {
                     int err = SSL_get_error(ssl, bytes_read);
                     if (err == SSL_ERROR_ZERO_RETURN || (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_SYSCALL)) {
-                        std::cout << "[INFO] Player explicitly disconnected: " << player_id << std::endl;
+                        logger << "[" << ts() << "] [DISCONNECT] Player explicitly disconnected: " << player_id << std::endl;
                         player_dropped = true;
                     }
                 }
             }
 
             if (!player_dropped && std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_active).count() > 3) {
-                std::cout << "[WARNING] Player timed out (Force Quit): " << player_id << std::endl;
+                logger << "[" << ts() << "] [TIMEOUT] Player timed out (Force Quit / No heartbeat): " << player_id << std::endl;
                 player_dropped = true;
             }
 
@@ -192,6 +222,42 @@ int main() {
             }
         }
 
+        // TUI Dashboard Drawing Logic (Updates twice a second to prevent flickering)
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_dashboard_draw).count() > 500) {
+            std::cout << "\033[2J\033[H"; // ANSI Escape: Clear screen and move cursor to top-left
+            std::cout << "+----------------------------------------------------------------------+\n";
+            std::cout << "| G.N.E. SERVER DIAGNOSTICS | PORT: " << PORT << " | TICK: " << std::setw(15) << std::left << current_tick << " |\n";
+            std::cout << "+----------------------------------------------------------------------+\n";
+            std::cout << std::left << "| " << std::setw(20) << "PLAYER ID" 
+                      << std::setw(15) << "| POS (X, Y)" 
+                      << std::setw(15) << "| PKT LOSS" 
+                      << std::setw(15) << "| ARRIVAL GAP" << "|\n";
+            std::cout << "+----------------------------------------------------------------------+\n";
+            
+            if (active_players.empty()) {
+                std::cout << "| Waiting for connections...                                           |\n";
+            } else {
+                for (const auto& pair : active_players) {
+                    float loss_pct = 0.0f;
+                    if (pair.second.total_packets_received > 0) {
+                        loss_pct = ((float)pair.second.total_packets_lost / (pair.second.total_packets_received + pair.second.total_packets_lost)) * 100.0f;
+                    }
+
+                    std::string pos_str = std::to_string((int)pair.second.x) + ", " + std::to_string((int)pair.second.y);
+                    std::string loss_str = std::to_string((int)loss_pct) + "% (" + std::to_string(pair.second.total_packets_lost) + ")";
+                    std::string gap_str = std::to_string(pair.second.latest_arrival_gap_ms) + " ms";
+
+                    std::cout << "| " << std::left << std::setw(19) << pair.first
+                              << "| " << std::setw(13) << pos_str
+                              << "| " << std::setw(13) << loss_str
+                              << "| " << std::setw(13) << gap_str << "|\n";
+                }
+            }
+            std::cout << "+----------------------------------------------------------------------+\n";
+            std::cout << "  (View server_events.log for connection and handshake history)\n";
+            last_dashboard_draw = now;
+        }
+
         auto frame_end = std::chrono::steady_clock::now();
         auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(frame_end - frame_start);
         if (elapsed_time < target_frame_time) {
@@ -201,5 +267,6 @@ int main() {
 
     SSL_CTX_free(ctx);
     close(server_fd);
+    logger.close();
     return 0;
 }
